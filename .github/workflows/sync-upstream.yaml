@@ -1,0 +1,88 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    - cron: "0 2 * * *"  # 2AM UTC daily
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Override version (e.g., v1.25.6b1). Leave empty for auto-detect."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get latest upstream version
+        id: upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            LATEST="${{ inputs.version }}"
+            echo "Using manual version: $LATEST"
+          else
+            LATEST=$(gh api repos/rancher/image-build-base/releases/latest --jq '.tag_name')
+            echo "Latest upstream: $LATEST"
+          fi
+          echo "version=$LATEST" >> $GITHUB_OUTPUT
+
+      - name: Get current version
+        id: current
+        run: |
+          if [ -f .upstream-version ]; then
+            CURRENT=$(cat .upstream-version)
+          else
+            CURRENT=""
+          fi
+          echo "Current version: $CURRENT"
+          echo "version=$CURRENT" >> $GITHUB_OUTPUT
+
+      - name: Check if update needed
+        id: check
+        run: |
+          if [ "${{ steps.upstream.outputs.version }}" != "${{ steps.current.outputs.version }}" ]; then
+            echo "Update needed: ${{ steps.current.outputs.version }} -> ${{ steps.upstream.outputs.version }}"
+            echo "update=true" >> $GITHUB_OUTPUT
+          else
+            echo "Already up to date: ${{ steps.current.outputs.version }}"
+            echo "update=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Update version file
+        if: steps.check.outputs.update == 'true'
+        run: |
+          echo "${{ steps.upstream.outputs.version }}" > .upstream-version
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .upstream-version
+          git commit -m "chore: sync upstream version to ${{ steps.upstream.outputs.version }}"
+          git push
+
+      - name: Check if tag exists
+        if: steps.check.outputs.update == 'true'
+        id: tag-check
+        run: |
+          if git rev-parse "${{ steps.upstream.outputs.version }}" >/dev/null 2>&1; then
+            echo "Tag already exists"
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "Tag does not exist"
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create and push tag
+        if: steps.check.outputs.update == 'true' && steps.tag-check.outputs.exists == 'false'
+        run: |
+          git tag "${{ steps.upstream.outputs.version }}"
+          git push origin "${{ steps.upstream.outputs.version }}"
+          echo "Created tag: ${{ steps.upstream.outputs.version }}"
