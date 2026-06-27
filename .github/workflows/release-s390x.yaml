@@ -1,24 +1,40 @@
+# Hardened QEMU s390x release workflow for the image-build family.
+# Build the s390x leg under QEMU on ubuntu-latest, then combine it with the upstream amd64/arm64
+# legs (pinned BY DIGEST) into one published manifest. workflow_dispatch-only.
+#
+# Per-fork: this file is committed to the fork's DEFAULT branch (so workflow_dispatch resolves — C2)
+# under the fork's own filename (base=release-s390x.yaml, coredns=release-s390x.yml). IMAGE_NAME /
+# UPSTREAM_IMAGE below must be set to the fork's image when aligning.
+#
+# Hardening vs the original:
+#   C3  manifest legs are DETECTED from the upstream manifest list, not hardcoded amd64+arm64
+#   H2  upstream legs pulled BY DIGEST and the digest is echoed for the verifier to assert
+#   M3  Go build-arg derivation FAILS CLOSED if the tag doesn't match vX.Y.ZbN
+#   M4  the combined tag is treated as immutable — overwrite requires force=true
+#   M5  workflow_dispatch-only (no push:tags double-fire); no GitHub Release job
 name: Release s390x
 
 on:
-  push:
-    tags:
-      - 'v*'
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to release (e.g., v1.25.6b1)"
+        description: "Tag to release (e.g., v1.24.12b1)"
         required: true
         type: string
+      force:
+        description: "Overwrite the combined tag if it already exists (treat as immutable otherwise)"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
-  contents: write
+  contents: read
   packages: write
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/hardened-build-base
-  UPSTREAM_IMAGE: rancher/hardened-build-base
+  IMAGE_NAME: ${{ github.repository_owner }}/hardened-build-base   # rendered per-fork by apply-s390x-patch.sh
+  UPSTREAM_IMAGE: rancher/hardened-build-base                              # rendered per-fork by apply-s390x-patch.sh
 
 jobs:
   build-s390x:
@@ -27,23 +43,29 @@ jobs:
       tag: ${{ steps.get-tag.outputs.tag }}
       go_version: ${{ steps.get-tag.outputs.go_version }}
     steps:
-      - name: Checkout
+      # Build the s390x leg from the RELEASE TAG, not the dispatch ref. The workflow is dispatched on
+      # the default branch (so workflow_dispatch resolves it) but the source must be the tag, or the
+      # s390x leg would be a different software version than the upstream amd64/arm64 legs.
+      - name: Checkout (at the release tag)
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
 
-      - name: Get tag
+      - name: Get tag + validate Go version (M3 fail-closed)
         id: get-tag
+        env:
+          TAG: ${{ inputs.tag }}        # via env, never inlined into the shell (injection-safe)
         run: |
-          if [ -n "${{ inputs.tag }}" ]; then
-            TAG="${{ inputs.tag }}"
-          else
-            TAG="${{ github.ref_name }}"
+          set -euo pipefail
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          # vX.Y.ZbN -> X.Y.Z ; refuse to pass an unmatched raw tag through as the build-arg.
+          GO_VERSION="$(printf '%s' "$TAG" | sed -nE 's/^v([0-9]+\.[0-9]+\.[0-9]+)b[0-9]+$/\1/p')"
+          if [ -z "$GO_VERSION" ]; then
+            echo "::error::Cannot derive Go version from tag '$TAG' (expected vX.Y.ZbN). Aborting."
+            exit 1
           fi
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
-
-          # Extract Go version: v1.25.6b1 → 1.25.6
-          GO_VERSION=$(echo "$TAG" | sed -E 's/^v([0-9]+\.[0-9]+\.[0-9]+)b[0-9]+$/\1/')
-          echo "go_version=$GO_VERSION" >> $GITHUB_OUTPUT
-          echo "Tag: $TAG, Go Version: $GO_VERSION"
+          echo "go_version=$GO_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Tag: $TAG, Go: $GO_VERSION"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -67,8 +89,7 @@ jobs:
           push: true
           build-args: |
             GOLANG_VERSION=${{ steps.get-tag.outputs.go_version }}
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.get-tag.outputs.tag }}-s390x
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.get-tag.outputs.tag }}-s390x
 
   create-manifest:
     runs-on: ubuntu-latest
@@ -84,72 +105,51 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Pull and tag upstream amd64 image
+      - name: M4 — refuse to clobber an existing combined tag unless force
+        env:
+          TAG: ${{ needs.build-s390x.outputs.tag }}
+          FORCE: ${{ inputs.force }}
         run: |
-          TAG="${{ needs.build-s390x.outputs.tag }}"
+          set -euo pipefail
+          IMG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG"
+          if docker buildx imagetools inspect "$IMG" >/dev/null 2>&1; then
+            if [ "$FORCE" != "true" ]; then
+              echo "::error::$IMG already exists and force=false (tags are immutable). Re-run with force=true to overwrite."
+              exit 1
+            fi
+            echo "::warning::$IMG exists; force=true → overwriting."
+          fi
 
-          # Pull upstream amd64
-          docker pull --platform linux/amd64 ${{ env.UPSTREAM_IMAGE }}:$TAG
-          docker tag ${{ env.UPSTREAM_IMAGE }}:$TAG ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG-amd64
-          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG-amd64
-
-      - name: Pull and tag upstream arm64 image
+      # H2/C3/M2: combine the s390x leg with the upstream legs referenced DIRECTLY by digest.
+      # No pull/retag/push roundtrip — imagetools copies the digest-pinned upstream manifests into
+      # the target repo, so the published per-arch digests are guaranteed to match what the verifier
+      # recorded at preflight. Legs are detected dynamically (not hardcoded amd64+arm64).
+      - name: Create and push multi-arch manifest (digest-pinned legs)
+        env:
+          TAG: ${{ needs.build-s390x.outputs.tag }}
+          UP: ${{ env.UPSTREAM_IMAGE }}
         run: |
-          TAG="${{ needs.build-s390x.outputs.tag }}"
-
-          # Pull upstream arm64
-          docker pull --platform linux/arm64 ${{ env.UPSTREAM_IMAGE }}:$TAG
-          docker tag ${{ env.UPSTREAM_IMAGE }}:$TAG ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG-arm64
-          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG-arm64
-
-      - name: Create and push multi-arch manifest
-        run: |
-          TAG="${{ needs.build-s390x.outputs.tag }}"
-
-          docker buildx imagetools create -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG-amd64 \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG-arm64 \
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG-s390x
-
-          echo "Created multi-arch manifest: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG"
+          set -euo pipefail
+          IMG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          RAW="$(docker buildx imagetools inspect --raw "$UP:$TAG")"
+          mapfile -t LEGS < <(echo "$RAW" | jq -r --arg up "$UP" '.manifests[]
+            | select(.platform.os=="linux" and .platform.architecture!="unknown")
+            | "\($up)@\(.digest)"')
+          if [ "${#LEGS[@]}" -eq 0 ]; then
+            echo "::error::no real linux upstream legs detected for $UP:$TAG — refusing to publish s390x-only"
+            exit 1
+          fi
+          echo "upstream legs:"; printf '  %s\n' "${LEGS[@]}"
+          docker buildx imagetools create -t "$IMG:$TAG" "$IMG:$TAG-s390x" "${LEGS[@]}"
+          echo "Created: $IMG:$TAG"
 
       - name: Verify manifest
-        run: |
-          TAG="${{ needs.build-s390x.outputs.tag }}"
-          docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$TAG
-
-  release:
-    runs-on: ubuntu-latest
-    needs: [build-s390x, create-manifest]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ needs.build-s390x.outputs.tag }}
-          name: Release ${{ needs.build-s390x.outputs.tag }}
-          body: |
-            ## Docker Images
-
-            Multi-architecture image available on GHCR:
-            ```
-            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.build-s390x.outputs.tag }}
-            ```
-
-            Supported architectures:
-            - linux/amd64 (from upstream rancher/hardened-build-base)
-            - linux/arm64 (from upstream rancher/hardened-build-base)
-            - linux/s390x (built by this workflow)
-
-            ## Go Version
-            Go ${{ needs.build-s390x.outputs.go_version }}
-
-            ## Notes
-            - s390x image includes Trivy scanner (v0.68.2+)
-            - s390x image does NOT use BoringCrypto (not supported on s390x)
-          draft: false
-          prerelease: false
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.build-s390x.outputs.tag }}
+        run: |
+          set -euo pipefail
+          IMG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          docker buildx imagetools inspect "$IMG:$TAG"
+          docker buildx imagetools inspect --raw "$IMG:$TAG" \
+            | jq -e '[.manifests[].platform.architecture] | index("s390x") != null' >/dev/null \
+            || { echo "::error::s390x leg missing from combined manifest"; exit 1; }
