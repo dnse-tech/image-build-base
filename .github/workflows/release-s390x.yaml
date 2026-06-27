@@ -43,13 +43,15 @@ jobs:
       tag: ${{ steps.get-tag.outputs.tag }}
       go_version: ${{ steps.get-tag.outputs.go_version }}
     steps:
-      # Build the s390x leg from the RELEASE TAG, not the dispatch ref. The workflow is dispatched on
-      # the default branch (so workflow_dispatch resolves it) but the source must be the tag, or the
-      # s390x leg would be a different software version than the upstream amd64/arm64 legs.
-      - name: Checkout (at the release tag)
+      # Build the s390x leg from the per-version build branch, NOT the dispatch ref and NOT the bare
+      # tag. The workflow is dispatched on the default branch (so workflow_dispatch resolves it), but
+      # the source must be fix/<tag>-s390x = the tag's tree (correct component/trivy versions, matching
+      # the upstream amd64/arm64 legs) + the injected s390x Dockerfile patch. apply-s390x-patch.sh
+      # creates and pushes this branch before dispatch.
+      - name: Checkout (s390x-patched build branch off the tag)
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag }}
+          ref: fix/${{ inputs.tag }}-s390x
 
       - name: Get tag + validate Go version (M3 fail-closed)
         id: get-tag
