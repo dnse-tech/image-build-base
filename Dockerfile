@@ -16,6 +16,16 @@ RUN set -ex; \
     tar -xzf trivy_${TRIVY_VERSION}_Linux-ARM64.tar.gz; \
     mv trivy /usr/local/bin
 
+FROM alpine:3.23 as trivy-s390x
+ARG TRIVY_VERSION=0.56.2
+RUN set -ex; \
+    TRIVY_TARBALL="trivy_${TRIVY_VERSION}_Linux-s390x.tar.gz"; \
+    BASE="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}"; \
+    wget -q "${BASE}/${TRIVY_TARBALL}"; \
+    wget -q "${BASE}/trivy_${TRIVY_VERSION}_checksums.txt"; \
+    grep " ${TRIVY_TARBALL}$" "trivy_${TRIVY_VERSION}_checksums.txt" | sha256sum -c -; \
+    tar -xzf "${TRIVY_TARBALL}"; \
+    mv trivy /usr/local/bin
 FROM trivy-${TARGETARCH} as trivy-base
 
 FROM alpine:3.23
