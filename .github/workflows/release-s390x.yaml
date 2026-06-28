@@ -1,5 +1,5 @@
 # Hardened QEMU s390x release workflow for the image-build family.
-# Build the s390x leg under QEMU on ubuntu-latest, then combine it with the upstream amd64/arm64
+# Build the s390x leg under QEMU on a self-hosted x64 runner (labels: self-hosted, Linux, X64, os:ubuntu-24.04), then combine it with the upstream amd64/arm64
 # legs (pinned BY DIGEST) into one published manifest. workflow_dispatch-only.
 #
 # Per-fork: this file is committed to the fork's DEFAULT branch (so workflow_dispatch resolves — C2)
@@ -38,7 +38,11 @@ env:
 
 jobs:
   build-s390x:
-    runs-on: ubuntu-latest
+    runs-on:
+      - self-hosted
+      - Linux
+      - X64
+      - os:ubuntu-24.04
     outputs:
       tag: ${{ steps.get-tag.outputs.tag }}
       go_version: ${{ steps.get-tag.outputs.go_version }}
@@ -94,7 +98,11 @@ jobs:
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.get-tag.outputs.tag }}-s390x
 
   create-manifest:
-    runs-on: ubuntu-latest
+    runs-on:
+      - self-hosted
+      - Linux
+      - X64
+      - os:ubuntu-24.04
     needs: build-s390x
     steps:
       - name: Set up Docker Buildx
